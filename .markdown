@@ -1,0 +1,695 @@
+# AI Fitness App Development: Recommendation Pipeline Architecture
+
+![AI Fitness App Development: Recommendation Pipeline Architecture by M TECHUB](./ai-fitness-recommendation-pipeline.jpg)
+
+## Overview
+
+An AI fitness recommendation system needs more than a model that receives a user profile and returns a workout.
+
+It needs a reliable process for validating inputs, understanding user context, selecting eligible workouts, ranking suitable options, enforcing constraints, and learning from feedback.
+
+Consider a beginner who wants a 20-minute strength session at home. They have a resistance band, prefer low-impact exercises, and have already completed several workouts this week.
+
+The system should use those inputs without inventing missing activity, recommending unavailable equipment, or allowing a high ranking score to override a declared restriction.
+
+This guide explains a fitness app recommendation pipeline with explicit boundaries between those responsibilities.
+
+> **Scope:** This is an illustrative architecture guide. The repository structure, API examples, and Python snippets do not represent a supplied production implementation or tested deployment. Software constraints do not replace professional medical assessment.
+
+For broader product planning, see [AI fitness app development](https://mtechub.com/blogs/ai-fitness-app-development/).
+
+
+## 1. High-Level Architecture
+
+Start with a modular monolith: one application containing clearly separated domain modules, with background workers added where necessary.
+
+This provides manageable component boundaries without immediately introducing independently deployed services.
+
+The central distinction is between eligibility and preference:
+
+- **Eligibility:** May this workout be returned for this user and request?
+- **Preference:** How should eligible workouts be ordered?
+
+A preference score must never override a hard constraint.
+
+```mermaid
+flowchart TD
+    P["1. Profile and preferences"] --> V["3. Validation and normalization"]
+    I["2. Activity ingestion"] --> V
+    V --> F["4. Features and context"]
+    F --> C["5. Candidate generation"]
+    W["Versioned workout catalogue"] --> C
+    C --> R["6. Recommendation ranking"]
+    R --> S["7. Final constraint checks"]
+    S --> A["8. API and application"]
+    A --> B["9. Feedback and outcomes"]
+    B --> M["10. Monitoring and evaluation"]
+    B --> I
+    M --> U["Reviewed version update"]
+    U --> R
+    U --> S
+```
+
+Feedback enters validated storage. It does not automatically trigger retraining or deployment.
+
+| Stage | Main responsibility | Output |
+|---|---|---|
+| Profile collection | Capture goals, experience, equipment, preferences, and restrictions | Versioned profile |
+| Activity ingestion | Import app and authorised integration records | Source-linked events |
+| Validation | Check schema, units, timestamps, and duplicates | Accepted records or explicit errors |
+| Feature processing | Construct freshness-aware user context | Feature snapshot |
+| Candidate generation | Retrieve eligible catalogue items | Candidate workouts |
+| Ranking | Order candidates using relevant preferences | Ranked candidates |
+| Constraint enforcement | Recheck individual and list-level requirements | Approved list or abstention |
+| API delivery | Return an authorised, consistent response | Recommendations and decision ID |
+| Feedback collection | Record impressions, acceptance, and outcomes | Validated feedback events |
+| Evaluation | Assess relevance, reliability, and release quality | Reports and deployment evidence |
+
+Record the profile, catalogue, feature, ranking, and policy versions used for a decision. Retain this information only as long as its documented purpose requires.
+
+## 2. Recommended Repository Structure
+
+```text
+fitness-recommendations/
+├── README.md
+├── pyproject.toml
+├── api/
+│   ├── routes.py
+│   ├── schemas.py
+│   └── dependencies.py
+├── src/
+│   ├── domain/
+│   ├── ingestion/
+│   ├── validation/
+│   ├── features/
+│   ├── candidates/
+│   ├── ranking/
+│   ├── safety/
+│   ├── storage/
+│   ├── feedback/
+│   ├── evaluation/
+│   └── observability/
+├── workers/
+├── config/
+├── tests/
+│   ├── unit/
+│   ├── integration/
+│   ├── contract/
+│   └── regression/
+└── docs/
+    ├── data-contracts.md
+    ├── recommendation-policy.md
+    └── operations.md
+```
+
+| Location | Responsibility |
+|---|---|
+| `api/` | Request and response schemas, routes, and authentication dependencies |
+| `src/domain/` | Shared types and domain invariants |
+| `src/ingestion/` | External adapters and event intake |
+| `src/validation/` | Structural and semantic checks |
+| `src/features/` | Point-in-time context construction |
+| `src/candidates/` | Retrieval and eligibility filtering |
+| `src/ranking/` | Baseline scoring and optional learned ranking |
+| `src/safety/` | Final constraints and abstention decisions |
+| `src/storage/` | Persistence interfaces and implementations |
+| `src/feedback/` | Impression and outcome processing |
+| `src/evaluation/` | Evaluation datasets and release comparisons |
+| `src/observability/` | Operational metrics and diagnostic events |
+| `workers/` | Background processing using shared domain modules |
+| `config/` | Non-secret, versioned configuration |
+| `tests/` | Behavioural, integration, contract, and regression checks |
+| `docs/` | Contracts, policy decisions, and operating procedures |
+
+Keep recommendation logic out of route handlers. Both API requests and background jobs should invoke the same domain services.
+
+This is one possible structure, not a requirement to create a separate service for every directory.
+
+## 3. Data Ingestion and Validation
+
+Separate explicit user input from observed activity.
+
+Profile data may include:
+
+- Selected fitness goals.
+- Training experience.
+- Available equipment.
+- Preferred session duration.
+- Activity preferences.
+- Supported exercise exclusions.
+
+Activity records should preserve source identity and measurement context.
+
+Useful fields include:
+
+- Internal user reference.
+- Source provider and record ID.
+- Source revision, where available.
+- Activity type.
+- Start and end timestamps.
+- Units.
+- Import timestamp.
+- Available completeness information.
+
+For a planning reference, see the [fitness app data collection checklist](https://mtechub.com/blogs/fitness-app-data-collection-checklist/).
+
+### Validation rules
+
+Check both structure and meaning.
+
+A duration field can be numeric while still being negative. An activity can contain valid timestamps while ending before it starts.
+
+Validate:
+
+1. Required fields and supported values.
+2. Numeric ranges and units.
+3. Time-zone awareness and timestamp ordering.
+4. Duplicate identities and record revisions.
+5. Source ownership and user authorisation.
+6. Freshness requirements for downstream features.
+
+Use timezone-aware timestamps for instants and preserve local-time context where daily summaries require it.
+
+### Illustrative Python validation
+
+Assumptions: Python 3.11+, standard library only. The limits below are example product policy, not exercise guidance.
+
+```python
+# src/validation/profile.py
+
+def validate_duration(value: object) -> int:
+    if type(value) is not int:
+        raise ValueError("duration_minutes must be an integer")
+
+    if not 5 <= value <= 120:
+        raise ValueError("duration_minutes must be between 5 and 120")
+
+    return value
+```
+
+The exact type check prevents booleans from being accepted as integers.
+
+Do not invent missing measurements. Ask for required information, preserve optional unknown values, and label stale records explicitly.
+
+For supported wearable sources, document the complete ingestion route. See [fitness app development with wearable integration](https://mtechub.com/blogs/fitness-app-development-wearable-integration/).
+
+## 4. Feature Engineering and Context
+
+Features should represent information available when a recommendation is requested.
+
+| Feature | Purpose | Important limitation |
+|---|---|---|
+| Experience level | Select catalogue options for supported experience categories | User information can become outdated |
+| Duration limit | Match current available time | May differ from the saved preference |
+| Equipment set | Enforce practical compatibility | Unknown equipment is different from no equipment |
+| Selected goals | Support preference scoring | Catalogue goal tags need review |
+| Recent completed workouts | Manage repetition and context | History may be incomplete |
+| Recent frequency | Summarise recorded sessions in a defined window | Missing imports can distort the summary |
+| Training-load proxy | Summarise reliable activity inputs | Does not establish medical readiness |
+
+Store feature freshness and provenance.
+
+“No recorded workouts” must remain distinguishable from “workout history unavailable.”
+
+For offline evaluation, construct features using only information available before the historical decision. Future completions must not leak into earlier context.
+
+Keep derived features understandable where practical. A field such as `recorded_minutes_last_7_days` is easier to audit than an unsupported `readiness_score`.
+
+Measurement uncertainty also affects downstream features. See [fitness tracking app development](https://mtechub.com/blogs/fitness-tracking-app-development/) for related planning considerations.
+
+## 5. Candidate Generation and Ranking
+
+Candidate generation retrieves eligible workouts. Ranking orders those candidates.
+
+| Approach | Useful starting conditions | Main limitations |
+|---|---|---|
+| Rules-based filtering | Clear requirements and reviewed metadata | Rules need coverage and maintenance |
+| Content-based recommendation | Useful workout attributes and user preferences | Can produce repetitive results |
+| Collaborative filtering | Sufficient suitable interaction data | Cold start, sparsity, and popularity bias |
+| Learned ranking | Reliable labels and evaluation datasets | Greater training and serving complexity |
+| Hybrid recommendation | Evidence that combining methods adds value | More difficult debugging and operation |
+
+A rules-based baseline is often a practical initial implementation because its behaviour is inspectable.
+
+See [rules-based vs machine-learning fitness app development](https://mtechub.com/blogs/fitness-app-development-rules-vs-ml/) for a related architectural comparison.
+
+### Illustrative filtering and ranking
+
+Assumptions:
+
+- Catalogue metadata has already passed validation.
+- Restrictions use supported structured tags.
+- Scoring weights express example preferences.
+- Scores are not probabilities or medical suitability ratings.
+
+```python
+# src/ranking/baseline.py
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Context:
+    equipment: frozenset[str]
+    excluded_tags: frozenset[str]
+    level: str
+    goals: frozenset[str]
+    max_minutes: int
+
+
+@dataclass(frozen=True)
+class Workout:
+    id: str
+    required_equipment: frozenset[str]
+    exercise_tags: frozenset[str]
+    allowed_levels: frozenset[str]
+    goal_tags: frozenset[str]
+    minutes: int
+    published: bool = True
+
+
+def eligible(workout: Workout, context: Context) -> bool:
+    return (
+        workout.published
+        and workout.required_equipment <= context.equipment
+        and workout.exercise_tags.isdisjoint(context.excluded_tags)
+        and context.level in workout.allowed_levels
+        and 0 < workout.minutes <= context.max_minutes
+    )
+
+
+def preference_score(workout: Workout, context: Context) -> float:
+    goal_matches = len(workout.goal_tags & context.goals)
+    duration_gap = context.max_minutes - workout.minutes
+    return 2.0 * goal_matches - 0.05 * duration_gap
+
+
+def recommend(
+    catalogue: list[Workout],
+    context: Context,
+    limit: int = 3,
+) -> list[Workout]:
+    if type(limit) is not int or not 1 <= limit <= 20:
+        raise ValueError("limit must be an integer between 1 and 20")
+
+    candidates = [
+        workout for workout in catalogue
+        if eligible(workout, context)
+    ]
+
+    ranked = sorted(
+        candidates,
+        key=lambda workout: (
+            -preference_score(workout, context),
+            workout.id,
+        ),
+    )
+
+    approved = [
+        workout for workout in ranked
+        if eligible(workout, context)
+    ]
+
+    return approved[:limit]
+```
+
+A workout requiring dumbbells is excluded when the user has only a resistance band. Remaining workouts can then be ordered by preference.
+
+The repeated eligibility check is illustrative defence in depth. Production systems must also account for concurrent changes to profiles, catalogue status, and policy.
+
+## 6. Safety Constraints and Recommendation Quality
+
+Keep hard constraints outside the ranking model.
+
+Before returning results, check:
+
+- Equipment requirements.
+- Supported declared exclusions.
+- Experience eligibility.
+- Publication status.
+- Duplicate IDs.
+- Product-defined repetition limits.
+- Required context and freshness.
+- Explanation consistency.
+
+If essential information is missing, return a clarification state.
+
+If no eligible workouts remain, return an empty list with an understandable reason. Do not silently relax restrictions to fill the requested result count.
+
+Fallbacks must pass the same constraints.
+
+Generate explanations from actual decision reasons, such as:
+
+> Uses your available resistance band and matches your selected strength goal.
+
+Avoid unsupported statements about optimal results, medical suitability, or injury prevention.
+
+If an LLM phrases explanations, it must not change eligibility, invent exercises, or add unsupported claims.
+
+## 7. API Design and Application Integration
+
+### Example endpoint
+
+```http
+POST /api/v1/recommendations
+```
+
+The authenticated identity determines which saved profile and activity records are accessible.
+
+Do not use a caller-supplied user ID as proof of authorisation.
+
+### Illustrative request
+
+```json
+{
+  "context": {
+    "duration_minutes": 20,
+    "available_equipment": ["resistance_band"],
+    "preferred_activity": "strength"
+  },
+  "limit": 3
+}
+```
+
+Define which request fields may override preferences. Hard restrictions should require an explicit, authorised update process.
+
+### Illustrative response
+
+```json
+{
+  "request_id": "req_example_01",
+  "decision_id": "dec_example_01",
+  "status": "ok",
+  "generated_at": "2026-10-14T07:00:00Z",
+  "versions": {
+    "ranker": "rules-v1",
+    "constraints": "policy-v1",
+    "catalogue": "catalogue-v1"
+  },
+  "recommendations": [
+    {
+      "workout_id": "band_strength_20",
+      "duration_minutes": 20,
+      "reason_codes": [
+        "EQUIPMENT_MATCH",
+        "GOAL_MATCH"
+      ],
+      "explanation": "Uses your available band and matches your strength goal."
+    }
+  ],
+  "warnings": []
+}
+```
+
+Returning fewer than the requested number is valid when fewer eligible options exist.
+
+Define consistent application states:
+
+- `ok`
+- `needs_input`
+- `no_eligible_candidates`
+
+Use stable error codes for invalid input, unauthorised access, rate limits, and unavailable dependencies. Do not expose internal stack traces.
+
+A bounded top-K response is usually sufficient for recommendations. Historical decision lists can use cursor pagination with stable ordering.
+
+The mobile framework should follow application requirements. For related client-side planning, see [React Native vs Flutter for fitness app development](https://mtechub.com/blogs/react-native-vs-flutter-fitness-app-development/).
+
+## 8. Storage, Caching, and Background Processing
+
+A relational database can initially store:
+
+- User profiles.
+- Workout catalogue metadata.
+- Activity records.
+- Recommendation decisions.
+- Feedback events.
+
+Use transactions, versions, or appropriate snapshots when consistent inputs are required.
+
+### Caching
+
+Cache keys should account for:
+
+- User identity.
+- Profile version.
+- Relevant activity version.
+- Request context.
+- Catalogue version.
+- Ranking version.
+- Constraint-policy version.
+
+A time-to-live alone is insufficient when a user changes a restriction. Invalidate or bypass affected entries and recheck current constraints before delivery.
+
+### Background processing
+
+Workers may handle imports, expensive summaries, offline evaluation, and optional precomputed recommendations.
+
+Assume jobs can run more than once.
+
+Use idempotent writes, unique event IDs, bounded retries, and explicit handling of permanent failures. Consider a transactional outbox when database changes must reliably produce events.
+
+Integration failures should mark information as delayed or unavailable. They should not erase confirmed history or generate replacement measurements.
+
+See [wearable workout data handling](https://mtechub.com/blogs/wearable-workout-data-handling/) for related synchronisation concerns.
+
+## 9. Evaluation and Monitoring
+
+Evaluate candidate retrieval, ranking, constraints, and serving behaviour separately.
+
+| Measure | What it helps assess | Limitation |
+|---|---|---|
+| Precision@K | Relevance among returned items | Needs a clear relevance definition |
+| NDCG@K | Ordering with graded relevance | Depends on labels and candidate sets |
+| Candidate recall | Whether useful options reach ranking | Requires suitable reference labels |
+| Coverage | Reach across eligible users and catalogue items | Denominators must be defined |
+| Diversity | Variety among eligible recommendations | Must not override restrictions |
+| Acceptance and completion | Observed user response | Affected by exposure and circumstances |
+| Latency and failures | Operational reliability | Inspect tail latency and failure types |
+| Group-level results | Uneven performance across relevant users | Small groups and privacy need care |
+
+Engagement does not independently prove fitness benefit.
+
+For offline evaluation:
+
+1. Use time-aware splits.
+2. Prevent future-data leakage.
+3. Compare against the current baseline.
+4. Inspect cold-start and incomplete-data cases.
+5. Report uncertainty and dataset limitations.
+
+Record delivery separately from confirmed impressions. A server response does not prove that a user saw every recommendation.
+
+Link feedback to the decision, workout, and displayed position. Validate event ownership and deduplicate retries.
+
+For additional evaluation planning, see [how to measure fitness app recommendation quality](https://mtechub.com/blogs/measure-fitness-app-recommendation-quality/).
+
+## 10. Testing Strategy
+
+| Test area | Example requirement |
+|---|---|
+| Input validation | Reject invalid types and unsupported values |
+| Feature processing | Preserve point-in-time correctness |
+| Candidate filtering | Exclude unavailable equipment |
+| Ranking | Maintain deterministic ordering under ties |
+| Final constraints | Block restricted items regardless of score |
+| API contracts | Preserve stable schemas and error states |
+| Integrations | Apply revisions, deletions, and retries correctly |
+| Missing data | Distinguish unknown values from zero |
+| Security | Prevent cross-user and cross-tenant access |
+| Regression | Compare changes on fixed synthetic fixtures |
+| Recovery | Handle dependency failures without invalid fallback |
+
+### Illustrative unit test
+
+This example uses the earlier domain classes and recommendation function.
+
+```python
+# tests/unit/test_constraints.py
+
+import unittest
+
+from src.ranking.baseline import Context, Workout, recommend
+
+
+class ConstraintTests(unittest.TestCase):
+    def test_restricted_workout_is_not_returned(self):
+        context = Context(
+            equipment=frozenset(),
+            excluded_tags=frozenset({"jumping"}),
+            level="beginner",
+            goals=frozenset({"conditioning"}),
+            max_minutes=20,
+        )
+
+        catalogue = [
+            Workout(
+                id="jump_session",
+                required_equipment=frozenset(),
+                exercise_tags=frozenset({"jumping"}),
+                allowed_levels=frozenset({"beginner"}),
+                goal_tags=frozenset({"conditioning"}),
+                minutes=20,
+            ),
+            Workout(
+                id="standing_mobility",
+                required_equipment=frozenset(),
+                exercise_tags=frozenset({"mobility"}),
+                allowed_levels=frozenset({"beginner"}),
+                goal_tags=frozenset({"mobility"}),
+                minutes=15,
+            ),
+        ]
+
+        result = recommend(catalogue, context)
+
+        self.assertEqual(
+            [workout.id for workout in result],
+            ["standing_mobility"],
+        )
+```
+
+The restricted workout would score more highly if it reached ranking. The test expresses the requirement that preference cannot override an exclusion.
+
+These examples have not been executed as a supplied repository.
+
+For connected-device scenarios, see [testing fitness app integrations](https://mtechub.com/blogs/testing-fitness-app-integrations/).
+
+## 11. Privacy and Security
+
+Collect only information needed for the intended recommendation features.
+
+Implement:
+
+- Verified authentication.
+- Resource-level authorisation.
+- Encryption in transit.
+- Appropriate protection at rest.
+- Least-privilege access.
+- Secure credential and token handling.
+- Retention and deletion processes.
+- Restricted administrative access.
+- Logs without raw health readings or identifiable profile details.
+
+Pseudonymous identifiers can remain personal data. Hashing an identifier does not automatically anonymise a dataset.
+
+Deletion workflows should account for derived features, caches, recommendation records, and evaluation datasets. Define additional governance before using personal information for model training.
+
+For UK users, assess the UK GDPR and Data Protection Act 2018, including applicable amendments. Special-category health-data processing requires an appropriate Article 9 condition alongside an Article 6 lawful basis.
+
+For USA users, assess applicable federal and state requirements. HIPAA does not automatically apply to every consumer fitness application; applicability depends on the entities and activities involved.
+
+Obtain qualified legal advice for the actual service and data flows.
+
+For a related overview, see [fitness app HIPAA compliance and GDPR](https://mtechub.com/blogs/fitness-app-hipaa-compliance-and-gdpr/). Use official regulatory guidance when making legal decisions.
+
+## 12. Deployment and Continuous Improvement
+
+A practical release workflow is:
+
+1. Validate configuration and dependency changes.
+2. Run automated behavioural and integration checks.
+3. Evaluate changed logic against the current baseline.
+4. Build a versioned release artifact.
+5. Test in a separate staging environment.
+6. Release through a controlled rollout where appropriate.
+7. Monitor operational and recommendation-quality guardrails.
+8. Roll back or expand using predefined criteria.
+
+Version:
+
+- Feature definitions.
+- Ranking logic.
+- Model artifacts.
+- Constraint policies.
+- Catalogue metadata.
+- Relevant configuration.
+
+Rollback must preserve compatibility between the model and its expected feature schema.
+
+Keep constraints active during staged releases, shadow evaluation, and fallback operation.
+
+Use dependency locks, separate secrets by environment, and document database migrations.
+
+If external developers contribute, clarify access, handover, and deliverable ownership. See [fitness app development contracts and code ownership](https://mtechub.com/blogs/fitness-app-development-contracts-code-data-ownership/).
+
+## 13. Implementation Roadmap
+
+| Phase | Deliverables | Completion criteria |
+|---|---|---|
+| 1. Define requirements | Use cases, schemas, supported restrictions, metric definitions | Required inputs and abstention rules are agreed |
+| 2. Build validation and baseline | Validated profiles, reviewed catalogue, simple recommendations | Invalid inputs fail predictably |
+| 3. Separate retrieval and ranking | Candidate generation, scoring, final policy checks | Scores cannot override constraints |
+| 4. Integrate API and interface | Authenticated endpoint and clear response states | Clients handle success, clarification, and empty results |
+| 5. Add feedback and evaluation | Decision records, events, dashboards, baseline reports | Quality and reliability can be assessed |
+| 6. Consider advanced models | Reproducible training, versioned artifacts, rollout controls | Evidence justifies additional complexity |
+
+Delivery estimates depend on catalogue quality, integrations, team capacity, and evaluation data. These phases do not imply guaranteed timelines.
+
+If the business is still deciding which components to build, see [custom workout and meal planning app development: build or buy](https://mtechub.com/blogs/custom-workout-meal-planning-app-development/).
+
+Nutrition recommendations require their own content, policy, and validation requirements; they are outside this workout pipeline example.
+
+## 14. Assumptions and Limitations
+
+This guide assumes:
+
+- A curated workout catalogue.
+- Explicit user preferences.
+- Supported structured restrictions.
+- Authorised use of activity records.
+- A product focused on general fitness recommendations.
+
+Limitations include:
+
+- Catalogue errors can undermine correct filters.
+- User profiles can become outdated.
+- Wearable records may be incomplete or delayed.
+- Cold-start users may need additional input.
+- Completion does not establish health benefit.
+- Software checks cannot guarantee injury prevention.
+
+Future improvements should address observed weaknesses.
+
+Possible additions include better catalogue review, richer explicit feedback, improved candidate retrieval, and learned ranking supported by suitable evaluation.
+
+Do not introduce complex infrastructure merely because the product includes AI.
+
+## 15. Implementation Checklist
+
+- [ ] Define recommendation use cases and exclusions.
+- [ ] Separate hard constraints from soft preferences.
+- [ ] Specify profile, catalogue, and event contracts.
+- [ ] Preserve provenance, units, timestamps, and revisions.
+- [ ] Represent missing and stale data explicitly.
+- [ ] Build an interpretable baseline.
+- [ ] Recheck constraints before delivery.
+- [ ] Apply the same constraints to fallback results.
+- [ ] Provide stable response states and accurate explanations.
+- [ ] Enforce user and tenant access boundaries.
+- [ ] Make retries and event processing idempotent.
+- [ ] Define evaluation labels and prevent data leakage.
+- [ ] Monitor quality, latency, and failure categories.
+- [ ] Version features, ranking, models, and policies.
+- [ ] Document deletion, maintenance, and rollback.
+
+## Conclusion
+
+A reliable fitness app recommendation pipeline makes decisions understandable and testable.
+
+Validated inputs produce useful context. Candidate generation identifies eligible workouts. Ranking orders those options. Independent constraints govern delivery. Feedback and evaluation provide evidence for improvement.
+
+Begin with a system that can explain why a workout was eligible, why it was selected, and which evidence would justify changing that decision.
+
+## 16. References and Further Reading
+
+### Official Technical Documentation
+
+- [Python datetime documentation](https://docs.python.org/3/library/datetime.html)
+- [FastAPI OAuth2 scopes](https://fastapi.tiangolo.com/advanced/security/oauth2-scopes/)
+- [scikit-learn common pitfalls and data leakage](https://scikit-learn.org/stable/common_pitfalls.html)
+
+### Official Privacy Guidance
+
+- [ICO: Rules for special-category data](https://ico.org.uk/for-organisations/uk-gdpr-guidance-and-resources/lawful-basis/special-category-data/what-are-the-rules-on-special-category-data/)
+- [HHS: Resources for mobile health app developers](https://www.hhs.gov/hipaa/for-professionals/special-topics/health-apps/index.html)
