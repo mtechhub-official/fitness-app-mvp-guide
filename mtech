@@ -1,0 +1,355 @@
+# Fitness Tracking Data: Validation, Deduplication, and Accuracy Testing
+
+Fitness tracking data validation checks whether incoming records can be interpreted and processed safely. It does not establish whether a wearable measured the user accurately.
+
+This guide follows a fitness app importing step counts, heart-rate samples, and workout sessions from multiple sources. It explains how to validate records, prevent repeated counting, process corrections, and test measurements against independent references.
+
+## TL;DR
+
+- **Validation** checks structure, units, timestamps, and metric-specific rules.
+- **Deduplication** prevents repeated delivery from creating repeated records.
+- **Source selection and aggregation** determine how overlapping observations contribute to displayed results.
+- **Accuracy testing** compares measurements with an appropriate independent reference.
+- Preserve provenance, handle deletions, and tell users when data is incomplete or stale.
+
+## Contents
+
+- [Define the data contract](#define-the-data-contract)
+- [Fitness tracking data validation](#fitness-tracking-data-validation)
+- [Wearable data deduplication](#wearable-data-deduplication)
+- [A minimal ingestion pipeline](#a-minimal-ingestion-pipeline)
+- [Practical code examples](#practical-code-examples)
+- [Fitness tracker accuracy testing](#fitness-tracker-accuracy-testing)
+- [QA test matrix](#qa-test-matrix)
+- [Monitoring after release](#monitoring-after-release)
+- [Implementation checklist](#implementation-checklist)
+- [References](#references)
+
+## Define the data contract
+
+Normalize each integration into an internal contract before combining records. Decide which information the app needs using a [fitness app data collection checklist](https://mtechub.com/blogs/fitness-app-data-collection-checklist/).
+
+| Internal field | Purpose |
+|---|---|
+| `user_id` | Authenticated app account |
+| `source` | Stable integration/account namespace |
+| `source_record_id` | Source record identifier within that namespace |
+| `metric`, `value`, `unit` | Measurement type, numeric value, and canonical unit |
+| `start_at`, `end_at` | Offset-aware event timestamps |
+| `time_context` | Available original offsets and reporting-zone context |
+| `source_revision` | Comparable source version, when reliably available |
+| `ingested_at` | Server receipt timestamp |
+| `provenance` | Originating app/device and transformation details |
+| `status` | Processing decision, such as accepted or quarantined |
+
+These names are internal design choices, not universal API fields. Obtain `user_id` from trusted authentication context.
+
+Use `steps/count`, `heart_rate/bpm`, and `workout/s` in the examples below. The workout value represents elapsed duration; real sessions also need activity type and pause semantics.
+
+If an adapter expands a source heart-rate series into individual samples, generate deterministic child identifiers and retain the parent relationship. Corrections and deletions must reach every affected child.
+
+Store UTC instants alongside relevant calendar context. An offset does not identify an IANA time zone. Define whether daily totals follow the event’s local date or a selected reporting zone.
+
+## Fitness tracking data validation
+
+Apply wearable data quality checks in layers:
+
+1. **Structure:** Require scoped identifiers, supported metrics, finite numeric values, and parseable timestamps.
+2. **Units:** Convert documented equivalents into canonical units. Reject incompatible units.
+3. **Time:** Reject reversed intervals. Require positive duration for interval step counts and workout sessions.
+4. **Semantics:** Require nonnegative integer steps, positive heart rate, and explicitly defined workout duration.
+
+Handle future timestamps using a documented clock-skew allowance. Flag questionable records rather than silently moving their timestamps.
+
+Missing values are not zeros. Zero steps can describe an observed interval. An absent interval means coverage is unknown. A zero heart-rate reading should not become an accepted physiological measurement.
+
+Distinguish malformed records from potentially inaccurate measurements. A heart-rate record expressed in kilometers is malformed. A sharp heart-rate change might reflect motion artifact, device error, or a real event.
+
+Quarantine suspicious records with reason codes. Automatically deleting unusual values can hide systematic failures and bias accuracy analysis. A plausible record can still contain an inaccurate measurement.
+
+## Wearable data deduplication
+
+Separate record identity from overlapping observations:
+
+| Situation | Required behavior |
+|---|---|
+| Same source record delivered repeatedly | Maintain one current record |
+| Source record corrected | Apply a demonstrably newer version |
+| Two devices observe the same activity | Preserve both; apply source selection |
+| Aggregate intervals overlap | Resolve coverage before calculating totals |
+
+Matching timestamps or values alone cannot establish duplication. Two devices may independently report 80 bpm at the same instant. One underlying activity may also arrive through different integrations with unrelated identifiers.
+
+Suppose a watch reports 700 steps from 09:00–09:10 and a phone reports 650 steps over the same interval. Adding both produces 1,350 steps without evidence of additional movement.
+
+An explicit policy might prefer the user-selected watch and use phone observations only for uncovered intervals. Apply that policy where record boundaries support it. Splitting a coarse interval proportionally assumes uniform activity and does not recover the actual steps.
+
+Keep original observations separate from derived totals. Version the selection policy so totals remain explainable after changes.
+
+Health Connect provides aggregation with documented priority behavior. Verify the supported metric and aggregation semantics before relying on [platform totals](https://developer.android.com/health-and-fitness/health-connect/aggregate-data), and never add those totals to their contributing raw records.
+
+Heart-rate samples need their own selection policy; workout sessions need relationship matching and reviewable merge decisions. These choices belong in the broader [wearable workout data handling](https://mtechub.com/blogs/wearable-workout-data-handling/) design.
+
+## A minimal ingestion pipeline
+
+```mermaid
+flowchart TD
+    A["Receive records and changes"] --> B["Normalize units and provenance"]
+    B --> C{"Validate"}
+    C -->|Malformed or suspicious| Q["Reject or quarantine with reasons"]
+    C -->|Accepted| D["Persist idempotently"]
+    D --> E["Recompute affected aggregates"]
+    D --> F["Commit sync checkpoint"]
+    A --> G["Restricted audit trail"]
+```
+
+Preserve raw records temporarily or retain an audit trail sufficient to explain transformations and decisions. Restrict access, minimize collected fields, and define retention and deletion schedules. Treat privacy requirements as a separate design responsibility; [fitness app HIPAA and GDPR considerations](https://mtechub.com/blogs/fitness-app-hipaa-compliance-and-gdpr/) provide related planning context.
+
+Commit checkpoints only after associated changes are durable. A retry must safely replay already processed records. Delayed observations must update their event-date totals.
+
+[HealthKit anchored queries](https://developer.apple.com/documentation/healthkit/hkanchoredobjectquery) return added samples and deleted objects. [Health Connect synchronization](https://developer.android.com/health-and-fitness/health-connect/sync-data) exposes upsertions and deletions; deletion changes contain the record ID, so preserve the mapping to local records. These mechanisms do not provide interchangeable revision models.
+
+Process deletion events separately from measurement validation. Use minimal tombstones or ordered change state where necessary to prevent old retries from resurrecting deleted records. Recompute affected totals and reconcile when synchronization state expires.
+
+## Practical code examples
+
+These teaching examples use an internal scalar representation. They do not implement platform adapters, deletion processing, or aggregation and are not production-ready.
+
+### Python validation
+
+The standard-library example accepts canonical units. Adapters must perform documented conversions first.
+
+```python
+from datetime import datetime, timedelta, timezone
+from math import isfinite
+
+UNITS = {"steps": "count", "heart_rate": "bpm", "workout": "s"}
+
+def validate(record, now=None):
+    now = now or datetime.now(timezone.utc)
+    r = dict(record)
+
+    for key in ("user_id", "source", "source_record_id"):
+        if not isinstance(r.get(key), str) or not r[key].strip():
+            raise ValueError(f"Invalid {key}")
+
+    metric = r.get("metric")
+    if metric not in UNITS or r.get("unit") != UNITS[metric]:
+        raise ValueError("Unsupported metric/unit")
+
+    revision = r.get("source_revision")
+    if type(revision) is not int or not 0 <= revision <= 2**63 - 1:
+        raise ValueError("Comparable source revision required")
+
+    for key in ("start_at", "end_at"):
+        raw = r.get(key)
+        if not isinstance(raw, str):
+            raise ValueError(f"Missing {key}")
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.utcoffset() is None:
+            raise ValueError("Timestamp requires UTC offset")
+        r[key] = dt.astimezone(timezone.utc)
+
+    value = r.get("value")
+    if type(value) not in (int, float) or not isfinite(value):
+        raise ValueError("Finite numeric value required")
+
+    duration = (r["end_at"] - r["start_at"]).total_seconds()
+    if duration < 0:
+        raise ValueError("Reversed interval")
+
+    if metric == "steps":
+        if duration == 0 or value < 0 or int(value) != value:
+            raise ValueError("Invalid interval step count")
+    elif metric == "heart_rate" and value <= 0:
+        raise ValueError("Invalid heart rate")
+    elif metric == "workout":
+        if duration <= 0 or abs(value - duration) > 0.001:
+            raise ValueError("Elapsed duration mismatch")
+
+    # Example operational allowance, not an accuracy threshold.
+    r["status"] = (
+        "quarantined"
+        if r["end_at"] > now + timedelta(minutes=5)
+        else "accepted"
+    )
+    return r
+
+record = validate({
+    "user_id": "user-17",
+    "source": "example-watch/account-42",
+    "source_record_id": "steps/abc",
+    "source_revision": 2,
+    "metric": "steps",
+    "value": 700,
+    "unit": "count",
+    "start_at": "2026-10-18T09:00:00Z",
+    "end_at": "2026-10-18T09:10:00Z",
+})
+```
+
+Add context-specific plausibility rules separately. Do not reinterpret active workout duration as elapsed duration.
+
+### PostgreSQL persistence
+
+This internal schema requires an adapter supplying trustworthy, monotonically increasing source revisions. It stores current scalar records; production provenance and time-zone metadata require additional fields or related tables.
+
+```sql
+CREATE TABLE fitness_record (
+    user_id text NOT NULL,
+    source text NOT NULL,
+    source_record_id text NOT NULL,
+    source_revision bigint NOT NULL CHECK (source_revision >= 0),
+    metric text NOT NULL,
+    value double precision NOT NULL
+        CHECK (value >= 0 AND value < 'Infinity'::double precision),
+    unit text NOT NULL,
+    start_at timestamptz NOT NULL,
+    end_at timestamptz NOT NULL,
+    ingested_at timestamptz NOT NULL DEFAULT now(),
+    status text NOT NULL
+        CHECK (status IN ('accepted', 'quarantined')),
+    PRIMARY KEY (user_id, source, source_record_id),
+    CHECK (end_at >= start_at),
+    CHECK (
+        (metric = 'steps' AND unit = 'count'
+            AND value = trunc(value) AND end_at > start_at)
+        OR (metric = 'heart_rate' AND unit = 'bpm' AND value > 0)
+        OR (metric = 'workout' AND unit = 's'
+            AND end_at > start_at
+            AND abs(value - extract(epoch FROM end_at - start_at)) <= 0.001)
+    )
+);
+```
+
+After creating the table, execute this parameterized statement using a Psycopg 3 connection. Pass the validated `record` dictionary.
+
+```python
+UPSERT = """
+INSERT INTO fitness_record AS current (
+    user_id, source, source_record_id, source_revision,
+    metric, value, unit, start_at, end_at, status
+) VALUES (
+    %(user_id)s, %(source)s, %(source_record_id)s,
+    %(source_revision)s, %(metric)s, %(value)s, %(unit)s,
+    %(start_at)s, %(end_at)s, %(status)s
+)
+ON CONFLICT (user_id, source, source_record_id)
+DO UPDATE SET
+    source_revision = EXCLUDED.source_revision,
+    metric = EXCLUDED.metric,
+    value = EXCLUDED.value,
+    unit = EXCLUDED.unit,
+    start_at = EXCLUDED.start_at,
+    end_at = EXCLUDED.end_at,
+    status = EXCLUDED.status,
+    ingested_at = EXCLUDED.ingested_at
+WHERE EXCLUDED.source_revision > current.source_revision
+RETURNING source_record_id;
+"""
+
+def persist(conn, record):
+    with conn.transaction():
+        with conn.cursor() as cursor:
+            cursor.execute(UPSERT, record)
+            return cursor.fetchone() is not None
+```
+
+Equal or older revisions leave the existing row unchanged. [PostgreSQL returns no row](https://www.postgresql.org/docs/current/sql-insert.html) when the conflict-update condition is false.
+
+Detect equal-revision payload differences in the adapter or audit layer. A retry with conflicting content is not automatically harmless.
+
+Never manufacture a source revision from ingestion time. Health Connect documents modification metadata and client-version metadata with distinct semantics; neither should be mapped blindly into this integer contract.
+
+Without reliable ordering metadata, serialize synchronization and reconcile authoritative snapshots. Retain unresolved conflicts. A payload hash detects equality but cannot establish which payload is newer.
+
+## Fitness tracker accuracy testing
+
+Fitness data pipeline testing verifies delivery, transformations, and calculations. Sensor accuracy testing compares observations against independent references.
+
+| Metric | Reference approach |
+|---|---|
+| Steps | Synchronized video with defined counting rules and adjudication |
+| Heart rate | Electrocardiography (ECG), or a reference validated for the tested conditions |
+| Workout duration | Independent timed observations with explicit start, stop, and pause definitions |
+
+Peer-reviewed INTERLIVE recommendations provide validation frameworks for [steps](https://bjsm.bmj.com/content/55/14/780) and [wearable heart rate](https://bjsm.bmj.com/content/55/14/767). [Device studies](https://pubmed.ncbi.nlm.nih.gov/28538708/) also show why conclusions must remain tied to the tested devices, participants, and activities.
+
+Test placement, fit, activity type, intensity transitions, firmware, and participant differences. Include slow walking, non-step movements, and free-living conditions when relevant to intended use.
+
+Align clocks and compare equivalent windows. Report missing paired measurements and coverage; excluding difficult periods can make accuracy appear better.
+
+Define paired error as `device − reference`:
+
+- **Bias:** Mean signed error; overestimation and underestimation can cancel.
+- **MAE:** Mean absolute error in steps, bpm, or seconds.
+- **MAPE:** Mean absolute percentage error; undefined at zero reference values and unstable near zero.
+
+Use absolute false-step counts for zero-step windows. Examine agreement and error distributions rather than relying on correlation.
+
+Set acceptance criteria before testing, by metric and intended use. Daily summaries and time-sensitive coaching features require different evidence. These checks do not establish clinical validation.
+
+For a wider pre-launch protocol, see [how to test fitness tracking accuracy](https://mtechub.com/blogs/fitness-tracker-accuracy-testing/).
+
+## QA test matrix
+
+Use controlled fixtures when [testing fitness app integrations](https://mtechub.com/blogs/testing-fitness-app-integrations/). Verify both stored records and user-visible results.
+
+| Test scenario | Input condition | Expected behavior | Verification method |
+|---|---|---|---|
+| Exact-record retry | Same ID and revision twice | One current row; unchanged total | Compare rows and aggregate |
+| Source-record correction | Higher revision changes steps | Replace; recompute affected period | Inspect record and total |
+| Older revision arrives late | Revision 1 follows revision 2 | Keep revision 2 | Replay out of order |
+| Overlapping devices | Phone and watch cover same interval | Apply source policy | Inspect selected contributions |
+| Time-zone changes and DST | Travel or repeated local hour | Preserve instants; apply reporting rules | London and New York fixtures |
+| Delayed synchronization | Yesterday’s records arrive today | Update yesterday’s totals | Check event-date aggregate |
+| Permission revocation | Access removed during sync | Stop affected reads; do not infer zero | Platform integration test |
+| Source deletion | Imported ID deleted | Remove contribution; prevent resurrection | Delete, recompute, replay |
+| Zero versus missing | Zero steps versus absent interval | Preserve zero; mark unknown coverage | Inspect API and UI |
+| Invalid units | Steps expressed in `bpm` | Reject with reason | Validator test |
+| Interrupted sync and retry | Crash before checkpoint commit | Safe replay without duplicate counting | Inject crash and resume |
+
+[HealthKit does not reveal whether read permission was granted](https://developer.apple.com/documentation/healthkit/hkhealthstore/authorizationstatus(for:)). An empty response can reflect unavailable access, so do not treat it as confirmed revocation or delete cached records based only on absence.
+
+## Monitoring after release
+
+Measure by integration, metric, and adapter version:
+
+- **Duplicate-conflict rate:** Conflicting keys divided by attempted writes; separate retries, corrections, and stale revisions.
+- **Validation rate:** Rejected or quarantined records divided by received records, grouped by reason.
+- **Freshness:** Time since the latest usable event and successful synchronization.
+- **Processing latency:** Time from receipt to durable processing.
+- **Event age:** Receipt time minus event end, exposing delayed synchronization.
+- **Coverage and failures:** Available intervals, synchronization errors, and reconciliation failures.
+
+Conflict rates do not capture all duplicate step count data. Cross-source overlap may never violate a database key.
+
+Avoid unnecessary health values, raw payloads, and personal identifiers in logs. Prefer reason codes and restricted diagnostic samples.
+
+Show “Last synced,” partial coverage, and neutral unavailable states. An incomplete import should not appear as a confirmed zero-activity day.
+
+## Implementation checklist
+
+- [ ] Document adapter identifiers, units, and timestamp semantics.
+- [ ] Enforce authenticated account-scoped persistence keys.
+- [ ] Preserve provenance and transformation versions.
+- [ ] Test zero, missing, malformed, and suspicious inputs separately.
+- [ ] Replay corrections and older revisions in both orders.
+- [ ] Document source priority and unresolved overlap behavior.
+- [ ] Commit checkpoints after durable processing.
+- [ ] Test deletion and stale-retry resurrection.
+- [ ] Verify DST and travel reporting rules.
+- [ ] Define accuracy criteria and references before testing.
+- [ ] Display stale data and incomplete coverage.
+- [ ] Enforce diagnostic retention and access limits.
+
+## References
+
+- [Apple: HKAnchoredObjectQuery](https://developer.apple.com/documentation/healthkit/hkanchoredobjectquery)
+- [Apple: HealthKit authorizationStatus(for:)](https://developer.apple.com/documentation/healthkit/hkhealthstore/authorizationstatus(for:))
+- [Android Developers: Synchronize Health Connect data](https://developer.android.com/health-and-fitness/health-connect/sync-data)
+- [Android Developers: Read aggregated data](https://developer.android.com/health-and-fitness/health-connect/aggregate-data)
+- [PostgreSQL: INSERT and ON CONFLICT](https://www.postgresql.org/docs/current/sql-insert.html)
+- [INTERLIVE: Recommendations for determining the validity of consumer wearable and smartphone step count](https://bjsm.bmj.com/content/55/14/780)
+- [INTERLIVE: Recommendations for determining the validity of consumer wearable heart rate devices](https://bjsm.bmj.com/content/55/14/767)
+- [Shcherbina et al.: Accuracy in Wrist-Worn, Sensor-Based Measurements of Heart Rate and Energy Expenditure in a Diverse Cohort](https://pubmed.ncbi.nlm.nih.gov/28538708/)
