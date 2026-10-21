@@ -1,0 +1,479 @@
+# Offline Workout Tracking: Local Storage and Conflict Resolution
+
+![Offline workout tracking with local storage, queued synchronization, and conflict resolution](./offline-workout-tracking.png)
+
+## Overview
+
+Offline workout tracking lets users record exercises, sets, repetitions, and session completion without waiting for a network connection.
+
+This matters in basement gyms, outdoor training locations, and any environment where connectivity is unreliable. A remote-only save can fail, time out, or finish after the app has closed.
+
+An offline-first mobile app saves changes locally, updates the interface from durable local data, and synchronizes separately.
+
+The central reliability requirement is straightforward: a failed request must not erase a workout, and a successful retry must not create a duplicate.
+
+This guide assumes a SQLite-backed mobile database. TypeScript-style pseudocode illustrates application logic rather than an existing package API. The snippets have not been compiled or tested.
+
+## Table of Contents
+
+- [1. Design the Workout Data Model](#1-design-the-workout-data-model)
+- [2. Choose Local Persistence](#2-choose-local-persistence)
+- [3. Save Locally Before Syncing](#3-save-locally-before-syncing)
+- [4. Build a Durable Sync Queue](#4-build-a-durable-sync-queue)
+- [5. Resolve Concurrent Changes](#5-resolve-concurrent-changes)
+- [6. Prevent Duplicates and Lost Updates](#6-prevent-duplicates-and-lost-updates)
+- [7. Protect Workout Data](#7-protect-workout-data)
+- [8. Test Offline and Conflict Scenarios](#8-test-offline-and-conflict-scenarios)
+- [9. Implementation Checklist](#9-implementation-checklist)
+- [Related Reading](#related-reading)
+- [Technical References](#technical-references)
+
+## 1. Design the Workout Data Model
+
+Generate stable identifiers on the device before saving a workout. Give exercises and sets their own identifiers so later operations can target individual records.
+
+An illustrative local representation:
+
+```json
+{
+  "id": "workout-a12",
+  "userId": "account-42",
+  "startedAt": "2026-10-21T06:00:00Z",
+  "completedAt": null,
+  "exercises": [
+    {
+      "id": "exercise-b34",
+      "exerciseKey": "barbell-squat",
+      "sets": [
+        {
+          "id": "set-c56",
+          "repetitions": 8,
+          "weightKg": 40,
+          "durationSeconds": null
+        }
+      ]
+    }
+  ],
+  "createdAt": "2026-10-21T06:00:00Z",
+  "updatedAt": "2026-10-21T06:05:00Z",
+  "deletedAt": null,
+  "serverRevision": 7,
+  "localSequence": 12,
+  "syncStatus": "pending"
+}
+```
+
+Define measurement units explicitly. A field named `weightKg` avoids the ambiguity of an unlabeled `weight`.
+
+Keep occurrence, editing, and synchronization times separate:
+
+| Field | Meaning |
+| --- | --- |
+| `startedAt` | When the workout began |
+| `completedAt` | When the session finished |
+| `updatedAt` | When the record was edited |
+| `lastSyncedAt`, if stored | When synchronization was acknowledged |
+
+A delayed upload should not change the date of the workout.
+
+`serverRevision` identifies acknowledged server state. `localSequence` orders local edits and should not be compared across devices.
+
+Maintain an acknowledged server snapshot separately from the local working projection. The working projection includes pending local operations; the acknowledged snapshot provides a base for conflict detection and merging.
+
+Schema migrations must preserve both workout records and unsynchronized operations.
+
+## 2. Choose Local Persistence
+
+Choose local storage according to relationships, query requirements, platform support, and migration needs.
+
+| Storage option | Suitable use | Main considerations |
+| --- | --- | --- |
+| SQLite | Mobile workout histories, exercises, and sets | Transactions, indexes, migrations, write contention |
+| Native persistence framework | Apps using platform-specific persistence | Verify transaction and migration behavior |
+| IndexedDB | Browser-based workout applications | Transactions, quotas, eviction, schema upgrades |
+| Key-value storage | Preferences and small settings | Limited suitability for complex workout histories |
+
+SQLite transactions allow a workout change and its outbox operation to commit together. SQLite supports multiple readers but only one simultaneous writer, so keep write transactions short.
+
+IndexedDB supports structured browser storage but does not automatically synchronize with a backend. Browser quota and eviction behavior must also be considered.
+
+Local persistence cannot protect unsynchronized records against every event. App removal, device loss, or cleared browser data can remove the only available copy.
+
+For broader product context, see [Fitness Tracking App Development](https://mtechub.com/blogs/fitness-tracking-app-development/).
+
+## 3. Save Locally Before Syncing
+
+Persist meaningful actions as they happen. Do not wait until the entire workout finishes to save every completed set.
+
+The workout change and synchronization intent should share one local transaction.
+
+```typescript
+// Illustrative TypeScript-style pseudocode.
+// Database methods and helpers are application-defined.
+
+async function startWorkout(input: StartWorkoutInput) {
+  const account = requireActiveAccount();
+  const valid = validateStartWorkout(input);
+
+  const workoutId = newStableId();
+  const operationId = newStableId();
+
+  await localDb.transaction(async (tx) => {
+    await tx.insertWorkout({
+      id: workoutId,
+      userId: account.id,
+      startedAt: valid.startedAt,
+      completedAt: null,
+      serverRevision: null,
+      localSequence: 1,
+      syncStatus: "pending"
+    });
+
+    await tx.insertOutbox({
+      operationId,
+      userId: account.id,
+      workoutId,
+      sequence: 1,
+      kind: "createWorkout",
+      payload: {
+        startedAt: valid.startedAt
+      },
+      state: "pending",
+      attempts: 0
+    });
+  });
+
+  // The interface observes committed local records.
+  scheduleBestEffortSync(account.id);
+
+  return workoutId;
+}
+```
+
+If either database write fails, roll back both. Report the save failure rather than displaying a false confirmation.
+
+Run networking outside the transaction. A slow request should not keep a local database transaction open.
+
+Use separate interface states:
+
+- **Saved on this device:** The local transaction committed.
+- **Sync pending:** Changes remain in the outbox.
+- **Synced:** Relevant local operations were acknowledged.
+- **Needs attention:** A conflict or permanent error requires action.
+
+On restart, scan the durable queue. Synchronization should not depend on an in-memory callback surviving process termination.
+
+## 4. Build a Durable Sync Queue
+
+An outbox stores operations until the server acknowledges their outcomes.
+
+```json
+{
+  "operationId": "operation-d78",
+  "userId": "account-42",
+  "workoutId": "workout-a12",
+  "sequence": 13,
+  "kind": "addSet",
+  "payload": {
+    "exerciseId": "exercise-b34",
+    "setId": "set-e90",
+    "repetitions": 6,
+    "weightKg": 45
+  },
+  "state": "pending",
+  "attempts": 0,
+  "nextAttemptAt": null,
+  "leaseExpiresAt": null
+}
+```
+
+### Operation States
+
+Use pending, in-progress, retryable, and acknowledged states. Represent blocked authentication, validation failures, and conflicts separately.
+
+Claim work using a recoverable lease. If the worker terminates, an expired lease allows another attempt.
+
+For a manageable initial design, process operations sequentially per workout. Independent workouts can synchronize concurrently.
+
+### Request and Acknowledgment Sequence
+
+1. Claim the next eligible operation.
+2. Persist an immutable request containing its expected server revision.
+3. Send the request with its stable operation ID.
+4. Receive the server acknowledgment.
+5. Update the acknowledged snapshot and queue in one local transaction.
+6. Replay later pending operations to rebuild the local projection.
+
+Retries must reuse the same operation ID and request content.
+
+The server should atomically commit the mutation and its idempotency result. Reusing an accepted operation ID should return the recorded result without applying the mutation again.
+
+Scope idempotency records to the authenticated account and reject the same ID with different request content.
+
+### Retry Behavior
+
+A timeout does not establish whether the server applied the request. Retry the immutable operation rather than creating a replacement.
+
+Use capped exponential backoff with jitter:
+
+```typescript
+// Illustrative pseudocode; attempts begins at zero.
+
+const ceilingMs = Math.min(
+  maximumDelayMs,
+  initialDelayMs * 2 ** attempts
+);
+
+const delayMs = randomBetween(0, ceilingMs);
+```
+
+Respect applicable server retry instructions. Refresh expired authentication when possible. Stop automatic retries for errors requiring user correction.
+
+Connectivity changes can trigger attempts, but connectivity does not guarantee API access. Also check the queue when the app returns to the foreground.
+
+## 5. Resolve Concurrent Changes
+
+Consider two devices that downloaded revision 7.
+
+Device A changes a set from eight repetitions to ten. Device B changes the same set to six while offline.
+
+The second upload must not silently overwrite the first without an explicit conflict policy.
+
+### Last-Write-Wins
+
+Last-write-wins can suit replaceable preferences where overwriting is acceptable.
+
+Device timestamps are unreliable ordering evidence because clocks differ. Server acceptance order avoids device-clock comparisons but can still prioritize an older user action uploaded later.
+
+Use this policy only where its consequences are acceptable.
+
+### Version-Based Optimistic Concurrency
+
+Require each mutation to identify the server revision it expects.
+
+The server compares that revision and applies the update atomically.
+
+```typescript
+// Illustrative server pseudocode.
+// Helpers represent application-defined behavior.
+
+return serverDb.transaction(async (tx) => {
+  await tx.claimOperationKey(
+    account.id,
+    request.operationId,
+    request
+  );
+
+  const previous = await tx.findCompletedOperation(
+    account.id,
+    request.operationId
+  );
+
+  if (previous) {
+    requireMatchingRequest(previous, request);
+    return previous.result;
+  }
+
+  const current = await tx.lockOwnedWorkout(
+    account.id,
+    request.workoutId
+  );
+
+  if (current.revision !== request.expectedRevision) {
+    return conflict(current);
+  }
+
+  const updated = applyValidatedOperation(current, request);
+  updated.revision = current.revision + 1;
+
+  await tx.saveWorkout(updated);
+  await tx.completeOperation(
+    account.id,
+    request.operationId,
+    updated
+  );
+
+  return accepted(updated);
+});
+```
+
+The operation-key claim must serialize concurrent duplicate requests using the actual database's locking or uniqueness mechanisms. A losing request must wait for or retrieve the committed result rather than apply another mutation.
+
+A previously accepted duplicate should return its result before checking its now-stale expected revision.
+
+For HTTP entity tags, `If-Match` provides conditional update semantics. A failed precondition can produce `412 Precondition Failed`.
+
+### Field-Level and Operation-Level Merging
+
+Compare the common base, local changes, and current server state.
+
+Independent changes may merge safely:
+
+- Device A edits workout notes.
+- Device B adds a set with a new stable ID.
+
+Overlapping changes need another policy:
+
+- Both devices change the same repetition count.
+- One deletes an exercise while another edits its sets.
+
+Prefer explicit operations such as `addSet` over replacing an entire exercise array.
+
+A rebased request needs a new operation ID. Never change the payload of an uncertain request under an existing ID.
+
+### User-Assisted Resolution
+
+Where overwriting would lose meaningful information, show both versions.
+
+For the repetition conflict, let the user choose six, ten, or another value. Preserve both inputs until the resolution is saved.
+
+Deletion conflicts also need clear choices. Automatically recreating deleted content can violate user intent.
+
+## 6. Prevent Duplicates and Lost Updates
+
+Stable workout IDs prevent retried creation requests from producing duplicate records. They do not establish that two independently recorded sessions represent the same real-world workout.
+
+Treat similarity-based duplicate detection separately and avoid automatic deletion based only on matching times.
+
+### Preserve Deletion Tombstones
+
+Represent deletion using a tombstone containing identity and revision. Publish tombstones through the server change feed.
+
+Retain tombstones and idempotency results for a documented offline horizon. Devices returning after that horizon need reconciliation that preserves pending local work.
+
+### Apply Downloads Safely
+
+Use a server-issued change cursor.
+
+Apply each downloaded page and advance its cursor in the same local transaction. If applying the page fails, do not advance the cursor.
+
+Update the acknowledged server base, then replay pending local operations. Do not overwrite the local working record directly.
+
+Ignore stale server snapshots and surface operations that cannot be replayed safely.
+
+### Handle Partial Success
+
+Create a workout before uploading dependent exercises or sets.
+
+For batches, acknowledge each operation individually unless the backend guarantees atomic acceptance of the entire batch.
+
+An acknowledgment for local sequence 13 must not mark sequence 14 as synchronized.
+
+Do not delete the workout after sending a request. Archive only operations whose acknowledgment has been durably processed.
+
+Related integration considerations are covered in [Wearable Workout Data Handling](https://mtechub.com/blogs/wearable-workout-data-handling/).
+
+## 7. Protect Workout Data
+
+Partition local records, queries, and queues by account. Enforce server authorization using authenticated identity rather than trusting a submitted owner field.
+
+Store credentials using appropriate platform facilities and use TLS for network communication.
+
+Assess encryption at rest according to the threat model. Include database files, encryption keys, backups, and exports in that assessment.
+
+Avoid workout payloads, tokens, and private notes in logs.
+
+Collect only necessary data and define retention for active records, backups, tombstones, and synchronization receipts.
+
+On logout:
+
+1. Stop account-bound workers.
+2. Invalidate their local session context.
+3. Recheck account identity before applying responses.
+4. Handle pending records according to an explicit retention or discard policy.
+
+Never upload one account's queued data using another account's session.
+
+Review data requirements alongside the [Fitness App Data Collection Checklist](https://mtechub.com/blogs/fitness-app-data-collection-checklist/).
+
+Security controls support protection but do not automatically guarantee legal compliance.
+
+## 8. Test Offline and Conflict Scenarios
+
+Test durable outcomes, including database contents and queue state.
+
+| Scenario | Expected result |
+| --- | --- |
+| Start and complete a workout offline | Records remain locally readable |
+| Force-close after local commit | Queue survives and resumes after restart |
+| Local storage write fails | No partial save or false confirmation |
+| Reconnect after several edits | Operations synchronize in valid order |
+| Server commits but response disappears | Retry does not repeat the mutation |
+| Concurrent duplicate requests arrive | One mutation commits |
+| Worker terminates with an active lease | Lease expiry permits recovery |
+| User edits while an upload is running | Later edits remain pending |
+| Two devices edit the same field | Conflict policy preserves legitimate inputs |
+| Delete and edit overlap | No accidental resurrection |
+| Authentication expires | Pending records remain available |
+| Account switches during a request | Response cannot affect the wrong account |
+| Local schema migrates | Workouts and pending operations survive |
+| Download page fails halfway | Changes and cursor roll back together |
+
+Use unit tests for merge rules and projection replay. Use integration tests for transactions, authorization, revision checks, and duplicate delivery.
+
+For a deterministic conflict test, initialize both clients from revision 7, accept one edit, then submit the second against revision 7.
+
+For timeout testing, interrupt delivery after the server commits but before the client receives the response.
+
+These scenarios reveal failures that a simple airplane-mode test misses.
+
+See [Testing Fitness App Integrations](https://mtechub.com/blogs/testing-fitness-app-integrations/) for related testing considerations.
+
+## 9. Implementation Checklist
+
+- [ ] Generate stable workout, exercise, set, and operation IDs.
+- [ ] Define units and timestamp semantics.
+- [ ] Commit local mutations and outbox entries atomically.
+- [ ] Update the interface from committed local records.
+- [ ] Keep requests immutable after preparation.
+- [ ] Recover abandoned worker leases.
+- [ ] Enforce account-scoped server idempotency.
+- [ ] Apply revision checks atomically.
+- [ ] Document merge and deletion policies.
+- [ ] Preserve later edits when acknowledgments arrive.
+- [ ] Apply downloaded changes and cursors transactionally.
+- [ ] Retain unresolved work across retries and restarts.
+- [ ] Protect account boundaries and credentials.
+- [ ] Test migrations, duplicates, conflicts, and crash recovery.
+
+Reliable offline workout tracking depends on durable local intent, explicit synchronization outcomes, and conflict policies that preserve meaningful changes.
+
+Start with those mechanisms before introducing more complex distributed-state machinery.
+
+## Related Reading
+
+### Frameworks and Architecture
+
+- [React Native vs Flutter for Fitness App Development](https://mtechub.com/blogs/react-native-vs-flutter-fitness-app-development/)
+- [AI Fitness App Development](https://mtechub.com/blogs/ai-fitness-app-development/)
+- [Fitness App Development: Rules-Based vs. ML](https://mtechub.com/blogs/fitness-app-development-rules-vs-ml/)
+- [Custom Workout and Meal Planning App Development](https://mtechub.com/blogs/custom-workout-meal-planning-app-development/)
+
+### Data Quality and Workflows
+
+- [Measuring Fitness App Recommendation Quality](https://mtechub.com/blogs/measure-fitness-app-recommendation-quality/)
+- [Coaching Workflow Documentation](https://mtechub.com/blogs/coaching-workflow-documentation/)
+- [Fitness Tracker Accuracy Testing](https://mtechub.com/blogs/fitness-tracker-accuracy-testing/)
+
+### MVP Planning and Commercial Decisions
+
+- [Gym App MVP Validation](https://mtechub.com/blogs/gym-app-mvp-validation/)
+- [AI Fitness App MVP Features](https://mtechub.com/blogs/ai-fitness-app-mvp-features/)
+- [Fitness App MVP Development](https://mtechub.com/blogs/fitness-app-mvp-development/)
+- [Fitness App Development Cost](https://mtechub.com/blogs/fitness-app-development-cost/)
+- [Fitness App Development for Startups](https://mtechub.com/blogs/fitness-app-development-for-startups/)
+- [How to Monetize a Fitness App](https://mtechub.com/blogs/how-to-monetize-a-fitness-app/)
+
+### Ownership and Development Partners
+
+- [Fitness App Development Contracts: Code and Data Ownership](https://mtechub.com/blogs/fitness-app-development-contracts-code-data-ownership/)
+- [Fitness App Vendor Exit Checklist](https://mtechub.com/blogs/fitness-app-vendor-exit-checklist/)
+- [Fitness App Development Company Checklist](https://mtechub.com/blogs/fitness-app-development-company-checklist/)
+
+## Technical References
+
+- [SQLite — Transactions](https://www.sqlite.org/lang_transaction.html)
+- [MDN — IndexedDB Characteristics and Terminology](https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API/Basic_Terminology)
+- [MDN — Storage Quotas and Eviction Criteria](https://developer.mozilla.org/en-US/docs/Web/API/Storage_API/Storage_quotas_and_eviction_criteria)
+- [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html)
+- [Amazon Builders' Library — Making Retries Safe with Idempotent APIs](https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/)
