@@ -1,0 +1,34 @@
+
+# Gym App Development: Booking, Membership, and Attendance Data Models
+
+A PostgreSQL reference for gym management systems, covering bookings, membership eligibility, attendance tracking, database relationships, and concurrency-safe reservations.
+
+![Gym App Development: Booking, Membership, and Attendance Data Models](assets/gym-app-data-models.jpg)
+
+## Architecture and Assumptions
+
+A gym management application must keep three related domains separate:
+
+1. **Membership:** Determines a member's access eligibility.
+2. **Booking:** Reserves a place in a scheduled class.
+3. **Attendance:** Records whether the member actually attended.
+
+For product planning, read [Gym App MVP Validation](https://mtechub.com/blogs/gym-app-mvp-validation/).
+
+## Entity Relationship Diagram
+
+```mermaid
+erDiagram
+    members ||--o{ memberships : holds
+    membership_plans ||--o{ memberships : defines
+    gym_classes ||--o{ class_sessions : schedules
+    members ||--o{ bookings : makes
+    class_sessions ||--o{ bookings : receives
+    bookings ||--o| attendance_records : produces
+```
+
+## Security and Privacy
+
+Protect member information through authentication, role-based authorization, and appropriate data retention.
+
+Related reading: [Fitness App HIPAA Compliance and GDPR](https://mtechub.com/blogs/fitness-app-hipaa-compliance-and-gdpr/).
