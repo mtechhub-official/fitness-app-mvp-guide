@@ -1,0 +1,318 @@
+Workout and Meal Planning Apps: Build the Backend with PostgreSQL and REST APIs
+
+A code-focused implementation guide covering relational models, workout APIs, meal calculations, data integrity, authorization, and testing.
+
+A workout and meal planning app looks straightforward in the UI: choose an exercise, log a set, plan breakfast, and review progress. The backend is more demanding. It must distinguish templates from completed activities, preserve historical measurements, enforce record ownership, and calculate nutrition using consistent units.
+
+This guide uses PostgreSQL, Python/FastAPI-style endpoints, and SQLAlchemy examples to show a practical approach. The snippets illustrate patterns; they are not a complete production application. Authentication configuration, migrations, exception handling, and deployment infrastructure must be added before release.
+1. Model the data before creating endpoints
+Keep reusable catalog entries separate from user-owned records:
+users
+ ├── workout_plans ─── workout_plan_exercises ─── exercises
+ ├── workout_sessions ─── workout_sets ─────────── exercises
+ ├── meal_plans ─────── scheduled_meals ───────── recipes
+ └── progress_records                           └─ recipe_ingredients ── foods
+A workout plan says what is intended; a workout session says what happened. A recipe describes possible food portions; a meal log should preserve what was recorded at the time, even if the source food database changes later.
+PostgreSQL schema
+The following is a deliberately compact foundation. It requires PostgreSQL with gen_random_uuid() available.
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE exercises (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT NOT NULL,
+    category TEXT NOT NULL
+);
+
+CREATE TABLE workout_plans (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id),
+    title TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE workout_plan_exercises (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    plan_id UUID NOT NULL REFERENCES workout_plans(id) ON DELETE CASCADE,
+    exercise_id UUID NOT NULL REFERENCES exercises(id),
+    position INTEGER NOT NULL CHECK (position >= 0),
+    target_sets INTEGER NOT NULL CHECK (target_sets > 0),
+    target_reps INTEGER CHECK (target_reps > 0),
+    UNIQUE (plan_id, position)
+);
+
+CREATE TABLE workout_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id),
+    plan_id UUID REFERENCES workout_plans(id),
+    plan_snapshot JSONB NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,
+    CHECK (completed_at IS NULL OR completed_at >= started_at)
+);
+
+CREATE TABLE workout_sets (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL REFERENCES workout_sessions(id) ON DELETE CASCADE,
+    exercise_id UUID NOT NULL REFERENCES exercises(id),
+    set_number INTEGER NOT NULL CHECK (set_number > 0),
+    reps INTEGER CHECK (reps >= 0),
+    weight_kg NUMERIC(8, 2) CHECK (weight_kg >= 0),
+    UNIQUE (session_id, exercise_id, set_number)
+);
+
+CREATE INDEX idx_workout_plans_user ON workout_plans(user_id);
+CREATE INDEX idx_workout_sessions_user_time
+    ON workout_sessions(user_id, started_at DESC);
+Why use plan_snapshot? If a user later changes their template from three sets to four, a completed session must not silently change. Save the actual plan configuration at session creation and the completed results separately. For repeated exercises or supersets, model session exercise instances rather than identifying them only by exercise_id.
+2. Define predictable workout REST endpoints
+Method	Endpoint	Purpose
+GET	/api/v1/exercises	Paginated exercise catalog
+POST	/api/v1/workout-plans	Create a plan and ordered exercises
+GET	/api/v1/workout-plans/{id}	Retrieve a plan the user owns
+PUT	/api/v1/workout-plans/{id}	Replace plan with version checking
+POST	/api/v1/workout-sessions	Start a session with a plan snapshot
+POST	/api/v1/workout-sessions/{id}/sets	Record completed sets
+GET	/api/v1/progress	Read historical records
+
+
+Example request and response
+POST /api/v1/workout-plans
+Authorization: Bearer <access-token>
+Content-Type: application/json
+{
+  "title": "Upper Body Strength",
+  "exercises": [
+    {
+      "exercise_id": "4c621dad-3877-46e5-8fa3-55e21bb03b1d",
+      "position": 0,
+      "target_sets": 3,
+      "target_reps": 10
+    }
+  ]
+}
+A successful creation returns 201 Created and a Location header pointing to the new plan. Validate exercise IDs, duplicate positions, and valid target values. Insert the parent plan and child rows in one database transaction.
+3. Implement typed request validation with FastAPI
+FastAPI and Pydantic make constraints explicit at the API boundary:
+from uuid import UUID
+from pydantic import BaseModel, Field
+
+class PlannedExercise(BaseModel):
+    exercise_id: UUID
+    position: int = Field(ge=0)
+    target_sets: int = Field(gt=0, le=30)
+    target_reps: int | None = Field(default=None, gt=0, le=1000)
+
+class CreateWorkoutPlan(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    exercises: list[PlannedExercise] = Field(min_length=1)
+This is only the first layer of validation. The database should enforce foreign keys and uniqueness, while application services enforce ownership and business rules.
+Ownership checks in the database query
+For protected objects, never look up an item by ID and assume a valid login grants access.
+from uuid import UUID
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+def get_owned_plan(db: Session, plan_id: UUID, user_id: UUID):
+    return db.execute(
+        text("""
+            SELECT id, title, version
+            FROM workout_plans
+            WHERE id = :plan_id AND user_id = :user_id
+        """),
+        {"plan_id": plan_id, "user_id": user_id},
+    ).mappings().one_or_none()
+user_id must be taken from a verified authenticated identity provided by your auth middleware/dependency; never trust a client-supplied user ID. A trainer-client relationship needs its own explicit authorization model.
+Create the plan atomically
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+
+def create_workout_plan(db: Session, user_id, data: CreateWorkoutPlan):
+    positions = [item.position for item in data.exercises]
+    if len(positions) != len(set(positions)):
+        raise ValueError("Exercise positions must be unique")
+
+    with db.begin():
+        plan_id = db.execute(
+            text("""
+                INSERT INTO workout_plans (user_id, title)
+                VALUES (:user_id, :title)
+                RETURNING id
+            """),
+            {"user_id": user_id, "title": data.title},
+        ).scalar_one()
+
+        for item in data.exercises:
+            db.execute(
+                text("""
+                    INSERT INTO workout_plan_exercises
+                    (plan_id, exercise_id, position, target_sets, target_reps)
+                    VALUES (:plan_id, :exercise_id, :position,
+                            :target_sets, :target_reps)
+                """),
+                {"plan_id": plan_id, **item.model_dump()},
+            )
+    return plan_id
+Use a request-scoped SQLAlchemy session that is not already inside a transaction for this example. A foreign-key or uniqueness failure rolls back the plan and all inserted exercises. Map known database errors to useful HTTP responses instead of exposing SQL exception messages.
+4. Record actual workout results—not just planned targets
+For a completed set, the request might be:
+POST /api/v1/workout-sessions/8d9f8e48-376b-4810-b8ab-0d1e7f5baa98/sets
+{
+  "exercise_id": "4c621dad-3877-46e5-8fa3-55e21bb03b1d",
+  "set_number": 1,
+  "reps": 10,
+  "weight_kg": 35.5
+}
+On the server:
+1. Verify the authenticated user owns the session.
+2. Verify the session is not completed or locked.
+3. Verify the exercise is permitted in this session's snapshot, or apply the documented ad-hoc-exercise rule.
+4. Insert the set and return 201 Created.
+5. Use an idempotency strategy for retries, and a unique database key to prevent duplicate set records.
+Do not overwrite past sessions when templates change. If editing historical records is supported, record the correction separately or maintain an audit trail.
+5. Store food nutrition with explicit units
+Food portions become unreliable if one entry means “one serving,” another means “100 g,” and a third refers to cooked weight without saying so.
+
+A minimal nutrition table can use a consistent per-100-gram basis:
+CREATE TABLE foods (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    source_item_id TEXT,
+    energy_kcal_per_100g NUMERIC(10, 3),
+    protein_g_per_100g NUMERIC(10, 3),
+    carbs_g_per_100g NUMERIC(10, 3),
+    fat_g_per_100g NUMERIC(10, 3),
+    CHECK (energy_kcal_per_100g >= 0),
+    CHECK (protein_g_per_100g >= 0),
+    CHECK (carbs_g_per_100g >= 0),
+    CHECK (fat_g_per_100g >= 0)
+);
+
+CREATE TABLE recipes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id),
+    title TEXT NOT NULL
+);
+
+CREATE TABLE recipe_ingredients (
+    recipe_id UUID NOT NULL REFERENCES recipes(id) ON DELETE CASCADE,
+    food_id UUID NOT NULL REFERENCES foods(id),
+    ingredient_position INTEGER NOT NULL CHECK (ingredient_position >= 0),
+    grams NUMERIC(12, 3) NOT NULL CHECK (grams > 0),
+    PRIMARY KEY (recipe_id, ingredient_position)
+);
+Store where nutrition values came from. Raw and cooked ingredient forms need distinct data or valid conversion rules. Missing values must not silently become zero.
+Calculate nutrition using decimal arithmetic
+from decimal import Decimal, ROUND_HALF_UP
+
+
+def nutrient_for_portion(per_100g: Decimal, grams: Decimal) -> Decimal:
+    if grams <= 0:
+        raise ValueError("Portion must be positive")
+    if per_100g < 0:
+        raise ValueError("Nutrient value cannot be negative")
+    value = (per_100g * grams) / Decimal("100")
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+protein = nutrient_for_portion(Decimal("12"), Decimal("150"))
+assert protein == Decimal("18.00")
+Round only at defined calculation/display boundaries. For recipes, sum correctly converted ingredients and divide by the actual number of portions. If a recipe or reference food changes later, previously logged meals should retain the nutrition snapshot and source information originally used.
+
+Suggested meal endpoints:
+GET  /api/v1/recipes
+POST /api/v1/meal-plans
+GET  /api/v1/meal-plans/{id}
+POST /api/v1/meal-plans/{id}/meals
+GET  /api/v1/foods/{id}/nutrition
+POST /api/v1/meal-logs
+6. Handle concurrency, retries, and API errors
+Mobile devices frequently lose connectivity. The client may retry a successful request whose response never arrived.
+
+For create operations such as logging a meal or opening a workout session, use an idempotency key stored with the request hash and response outcome. Replays with the same key and equivalent request can return the prior result rather than creating duplicates. Define the retention window and conflicting-key behavior explicitly.
+
+For concurrent edits, use optimistic locking:
+UPDATE workout_plans
+SET title = :title,
+    version = version + 1,
+    updated_at = now()
+WHERE id = :plan_id
+  AND user_id = :user_id
+  AND version = :expected_version;
+If zero rows are updated because the version differs, return a 409 Conflict response and let the client reconcile changes.
+
+Use a consistent problem-details error structure:
+{
+  "type": "https://api.example.com/problems/validation",
+  "title": "Validation failed",
+  "status": 422,
+  "detail": "The submitted workout plan contains invalid fields.",
+  "errors": [
+    {"field": "exercises[0].target_sets", "message": "Must be greater than zero"}
+  ]
+}
+The api.example.com address above is an illustrative error-type identifier, not an actual service URL.
+7. Test the boundary cases that matter
+A useful test suite covers more than happy-path requests:
+from decimal import Decimal
+import pytest
+
+
+def test_nutrition_math():
+    assert nutrient_for_portion(
+        Decimal("12"), Decimal("150")
+    ) == Decimal("18.00")
+
+
+def test_reject_zero_portion():
+    with pytest.raises(ValueError):
+        nutrient_for_portion(Decimal("12"), Decimal("0"))
+Add integration tests to verify that:
+- User A receives no access to User B's plan or sessions.
+- A failed transaction leaves no orphaned plan or exercise rows.
+- Two identical retried create requests do not produce duplicate records.
+- Competing plan edits yield a detectable version conflict.
+- Logged historical nutrition does not change when a food definition changes.
+- Workout-session completion prevents unauthorized later writes.
+- Client pagination remains stable as the catalog grows.
+Run migrations and API contract checks in CI. Load-test the high-volume reads that matter to the application, such as exercise search and progress history, before adding caches or splitting services.
+8. A practical MVP architecture
+An early-stage application rarely needs microservices. Start with a modular backend:
+backend/
+├── app/
+│   ├── auth/
+│   ├── users/
+│   ├── exercises/
+│   ├── workouts/
+│   ├── nutrition/
+│   ├── meal_plans/
+│   ├── progress/
+│   ├── integrations/
+│   └── db/
+├── migrations/
+├── tests/
+└── pyproject.toml
+Use PostgreSQL for relational consistency; a background worker only for tasks that merit asynchronous processing (large imports, media processing, data reconciliation); and object storage for images and exercise demonstrations. Introduce a cache after measuring repeated expensive queries and defining invalidation rules.
+
+MVP priorities: user accounts, exercise catalog, workout plans, session logging, food reference data, meal plans/logs, and simple progress queries. Advanced AI recommendations and multiple wearable integrations can be postponed until their requirements are validated.
+9. Additional engineering resources
+These related guides cover decisions that sit alongside the core schema and API implementation:
+- Custom workout and meal planning app development — broader feature and product-scope considerations.
+- Fitness app data collection checklist — deciding which user data to collect.
+- Wearable workout data handling — managing device-originated activity records.
+- Testing fitness app integrations — validating external dependencies.
+- Fitness app MVP development — prioritizing the first production release.
+Official technical references:
+- PostgreSQL constraints
+- FastAPI documentation
+- SQLAlchemy session transactions
+- OWASP API Security Top 10
+- OpenAPI Specification
+- RFC 9457: Problem Details for HTTP APIs
+Conclusion
+The hardest part of workout and meal planning app development is not writing CRUD endpoints. It is preserving meaning across mutable plans, historical activity, nutritional estimates, and user-specific permissions. A strong first version uses explicit entities, database constraints, transaction-safe writes, stable API contracts, and repeatable tests. Build that foundation before adding advanced analytics, AI, or distributed infrastructure.
