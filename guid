@@ -1,0 +1,365 @@
+Fitness App Subscriptions: Entitlements, Webhooks, and Purchase Validation
+Developer guide · iOS (StoreKit) · Android (Google Play Billing) · TypeScript backend · PostgreSQL
+
+Scope: Verified purchases, account binding, server-side feature access, event processing, recovery, and testing. Code marked illustrative is deliberately adapter-based: it does not pretend that Apple and Google expose identical SDK methods.
+
+
+Contents
+1. The subscription problem
+2. Entitlements and lifecycle states
+3. System architecture
+4. Apple versus Google Play
+5. Purchase validation API
+6. Notification ingestion and reconciliation
+7. Database schema
+8. Entitlement authorization
+9. Difficult lifecycle cases
+10. Security and privacy
+11. Testing and troubleshooting
+12. Implementation checklist
+13. Related implementation guides
+1. The subscription problem
+A fitness app might sell Premium workout plans, Pro coaching, or advanced progress analytics. A payment callback does not prove an account should retain access forever. Renewals, grace periods, refunds, upgrades, account recovery, and missed notifications all change the answer.
+
+Keep these concepts separate:
+Concept	Meaning	Example
+Store product	Purchasable item configured with a store	fit_pro_monthly
+Purchase/transaction	Evidence of a store operation	Apple transaction ID; Google purchase token
+Subscription state	Store-reported lifecycle status	Active, grace, on hold, expired
+Entitlement	Your product's authorization decision	coaching: true
+
+
+Invariant: stores are authoritative for the underlying purchases; the backend entitlement service is authoritative for your app's protected features. Clients display access, but may not grant server-side access by toggling local flags.
+2. Entitlements and lifecycle states
+Define plan-to-feature mapping in one place. Do not scatter store product IDs across route handlers.
+// Illustrative domain model; not an Apple/Google SDK type.
+type Feature = "workout_tracking" | "training_plans" | "analytics" | "coaching";
+type Plan = "free" | "premium" | "pro";
+
+const FEATURES: Record<Plan, ReadonlySet<Feature>> = {
+  free: new Set(["workout_tracking"]),
+  premium: new Set(["workout_tracking", "training_plans", "analytics"]),
+  pro: new Set(["workout_tracking", "training_plans", "analytics", "coaching"]),
+};
+
+function includesFeature(plan: Plan, feature: Feature): boolean {
+  return FEATURES[plan].has(feature);
+}
+A successful verification can create a grant with a source, start, and end. A paid term need not end when auto-renewal is canceled; an actual refund or revocation can change access sooner. Grace and billing-hold behaviors depend on store configuration and verified status.
+{
+  "userId": "usr_123",
+  "plan": "premium",
+  "features": ["workout_tracking", "training_plans", "analytics"],
+  "verifiedAt": "2026-10-27T09:00:00Z",
+  "accessUntil": "2026-11-27T09:00:00Z"
+}
+This response is your application's JSON, not a store response. It is a snapshot: the server must still enforce authorization and account for later revocations.
+3. System architecture
+```mermaid
+flowchart LR
+    I[iOS StoreKit] --> B[Subscription API]
+    A[Android Play Billing] --> B
+    B --> V[Store-specific verifier]
+    V <--> S[(Apple / Google APIs)]
+    V --> D[(PostgreSQL)]
+    D --> E[Entitlement evaluator]
+    E --> R[Protected fitness APIs]
+    S --> N[Verified notification ingress]
+    N --> Q[Durable queue]
+    Q --> V
+    T[Scheduled reconciliation] --> V
+```
+Purchase path: client initiates a platform purchase → obtains its legitimate transaction reference → authenticated backend receives it → platform verifier confirms app/product/status → database upsert binds purchase to the correct user → entitlements are recomputed → app fetches updated access.
+
+Lifecycle path: store event → verify notification → durably enqueue → query current store state → update under transaction/lock → recompute grants. Notifications are signals to reconcile, not final entitlement decisions.
+Suggested API contracts
+POST /v1/subscriptions/verify
+Authorization: Bearer <USER_SESSION_TOKEN>
+Content-Type: application/json
+
+{"platform":"google_play","purchaseReference":"<PURCHASE_TOKEN>"}
+GET /v1/me/entitlements
+Authorization: Bearer <USER_SESSION_TOKEN>
+Identifiers and URLs above are application-defined endpoints. Never submit an API secret from the app.
+4. Apple versus Google Play
+Concern	Apple	Google Play
+Client	StoreKit	Play Billing Library
+Server verification	App Store Server API, signed transaction/renewal data	Google Play Developer API; purchases.subscriptionsv2.get
+Typical purchase reference	Transaction or original transaction identifier	Purchase token
+Subscription events	App Store Server Notifications V2 (signed JWS)	RTDN via Google Cloud Pub/Sub
+Recovery	StoreKit transaction history/current entitlements and server APIs	Play Billing purchase query plus backend token verification
+Important obligation	Verify signed data and correct subscription group/status	Acknowledge eligible purchases within Google's required window
+
+
+Apple's Get All Subscription Statuses returns statuses for auto-renewable subscriptions; verify its signed transaction and renewal information. The API accepts a transaction identifier associated with the app. Apple signed V2 notifications use JWS. Do not merely Base64-decode a JWS and call it verified.
+
+Google's subscriptionsv2.get retrieves current state for a purchase token. RTDN does not replace this lookup. Correctly acknowledge qualifying purchases, including relevant purchases originating outside the app; do not acknowledge pending transactions as completed.
+
+Official references: StoreKit · App Store Server API · Apple subscription status endpoint · Play Billing integration · Google subscription lifecycle. Consult the current documentation when implementing versions, event types, and deadlines.
+5. Purchase validation API
+Use a platform adapter so application policy is independent of payment-provider response formats.
+// Illustrative TypeScript interfaces and service logic.
+type Platform = "apple" | "google_play";
+type VerifiedPurchase = {
+  platform: Platform;
+  stableLineageKey: string;   // Derived with platform-specific rules
+  transactionKey: string;
+  appId: string;
+  productId: string;
+  storeState: string;
+  paidThrough: Date | null;
+  revoked: boolean;
+  permitsAccess: boolean;     // Computed from VERIFIED platform data
+};
+
+interface StoreVerifier {
+  verify(reference: string): Promise<VerifiedPurchase>;
+}
+
+interface SubscriptionRepository {
+  // Implement with a real DB transaction and unique ownership constraint.
+  applyVerifiedPurchase(userId: string, purchase: VerifiedPurchase): Promise<void>;
+  getEntitlements(userId: string): Promise<unknown>;
+}
+
+async function verifyPurchase(
+  authenticatedUserId: string,
+  platform: Platform,
+  reference: string,
+  adapters: Record<Platform, StoreVerifier>,
+  repo: SubscriptionRepository
+) {
+  if (!reference || reference.length > 8192) throw new Error("Invalid reference");
+  const result = await adapters[platform].verify(reference);
+  if (result.platform !== platform || result.appId !== EXPECTED_APP_IDS[platform]) {
+    throw new Error("Application mismatch");
+  }
+  if (!APPROVED_PRODUCTS.has(result.productId)) throw new Error("Unknown product");
+  // Reject if stableLineageKey is already bound to a different account.
+  // Recompute or revoke grants according to verified status, not a client claim.
+  await repo.applyVerifiedPurchase(authenticatedUserId, result);
+  return repo.getEntitlements(authenticatedUserId);
+}
+EXPECTED_APP_IDS and APPROVED_PRODUCTS are server-configured allowlists. The repository must reject attempts to claim another user's purchase. For Google subscription replacements, preserve linked token history as appropriate; for Apple, account for subscription lineage and groups. Do not assume an original transaction ID and a Google purchase token mean the same thing.
+Minimal route shape (Express)
+// Illustrative only: authenticateUser and all dependencies are app-owned.
+app.post("/v1/subscriptions/verify", authenticateUser, async (req, res) => {
+  const { platform, purchaseReference } = req.body;
+  if (platform !== "apple" && platform !== "google_play") {
+    return res.status(400).json({ error: "unsupported_platform" });
+  }
+  try {
+    const entitlements = await verifyPurchase(
+      req.user.id, platform, purchaseReference, storeAdapters, subscriptionRepo
+    );
+    return res.json(entitlements);
+  } catch (err) {
+    // Map account conflicts, invalid purchases and temporary store outages separately.
+    return res.status(503).json({ error: "verification_unavailable_or_failed" });
+  }
+});
+In production, validate JSON with a schema, limit body size, rate-limit the endpoint, classify errors accurately (400/403/409/503), and never log raw tokens.
+6. Notification ingestion and reconciliation
+Apple notifications must have their JWS signatures verified using the correct trust chain, app/environment checks, and current official validation procedures. Google Pub/Sub push requests must be authenticated according to the configured delivery mechanism; decode the Pub/Sub envelope, then query Google Play for authoritative subscription state. These are different verification mechanisms.
+```mermaid
+sequenceDiagram
+    participant Store as Apple / Google
+    participant Ingress as Notification endpoint
+    participant Queue as Durable inbox / queue
+    participant Worker as Reconciliation worker
+    participant API as Platform API
+    participant DB as DB + entitlements
+    Store->>Ingress: Signed notification / authenticated Pub/Sub push
+    Ingress->>Ingress: Verify origin, payload and context
+    Ingress->>Queue: Insert unique event + enqueue atomically
+    Ingress-->>Store: Acknowledge successful durable receipt
+    Queue->>Worker: Deliver event (possibly repeated)
+    Worker->>API: Fetch latest verified state
+    API-->>Worker: Current subscription status
+    Worker->>DB: Transactional upsert + recompute access
+    Worker-->>Queue: Mark processed
+```
+// Illustrative; verification functions MUST be supplied by tested platform adapters.
+async function ingestNotification(platform: Platform, request: unknown) {
+  const verified = await notificationAdapters[platform].verifyIncoming(request);
+  // Use real, validated platform event identity; don't hash arbitrary untrusted text.
+  await inbox.insertOnceAndEnqueue({
+    platform,
+    eventKey: verified.eventKey,
+    reference: verified.purchaseReference
+  });
+  return { accepted: true }; // Return correct HTTP acknowledgement for that transport.
+}
+
+async function processNotification(job: { platform: Platform; reference: string }) {
+  const current = await storeAdapters[job.platform].verify(job.reference);
+  await subscriptionRepo.applyStoreReconciliation(current);
+  // Worker ACK only after committed update; retry transient failures with backoff.
+}
+Rules: (1) uniqueness on (platform, event_key); (2) durably persist before acknowledging; (3) retry temporary store API errors; (4) use a dead-letter queue and alerting; (5) serialize/constrain updates to the same subscription lineage; (6) reconcile periodically even when notifications appear healthy. Event order is not a reliable substitute for fetching current state.
+
+For notification details: Apple V2 notification receipt and Google subscriptions / RTDN.
+7. Database schema
+Illustrative PostgreSQL schema; production needs migrations, environment partitioning, soft-delete/retention policies, additional indexes, historical lineage, and an outbox/inbox transaction strategy.
+CREATE TABLE app_users (
+  id UUID PRIMARY KEY
+);
+
+CREATE TABLE store_products (
+  id UUID PRIMARY KEY,
+  platform TEXT NOT NULL CHECK (platform IN ('apple','google_play')),
+  store_product_id TEXT NOT NULL,
+  internal_plan TEXT NOT NULL,
+  UNIQUE (platform, store_product_id)
+);
+
+CREATE TABLE subscriptions (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES app_users(id),
+  platform TEXT NOT NULL,
+  lineage_key TEXT NOT NULL,
+  product_id UUID REFERENCES store_products(id),
+  store_state TEXT NOT NULL,
+  access_until TIMESTAMPTZ,
+  last_verified_at TIMESTAMPTZ NOT NULL,
+  revoked BOOLEAN NOT NULL DEFAULT FALSE,
+  UNIQUE (platform, lineage_key)
+);
+
+CREATE TABLE store_transactions (
+  id UUID PRIMARY KEY,
+  subscription_id UUID NOT NULL REFERENCES subscriptions(id),
+  platform_transaction_key TEXT NOT NULL,
+  occurred_at TIMESTAMPTZ,
+  UNIQUE (subscription_id, platform_transaction_key)
+);
+
+CREATE TABLE entitlement_grants (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES app_users(id),
+  feature_code TEXT NOT NULL,
+  source_subscription_id UUID REFERENCES subscriptions(id),
+  effective_from TIMESTAMPTZ NOT NULL,
+  effective_until TIMESTAMPTZ
+);
+
+CREATE TABLE notification_inbox (
+  id UUID PRIMARY KEY,
+  platform TEXT NOT NULL,
+  event_key TEXT NOT NULL,
+  status TEXT NOT NULL,
+  received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (platform, event_key)
+);
+
+CREATE TABLE reconciliation_audit (
+  id UUID PRIMARY KEY,
+  subscription_id UUID REFERENCES subscriptions(id),
+  result TEXT NOT NULL,
+  reconciled_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+Enforce one purchase lineage → one application owner. Reassignment requires an explicit, audited recovery workflow. Store platform environment (sandbox versus production) in a production design to avoid identifier collisions and mixing test data.
+8. Entitlement authorization
+Do not assume that returning premium: true in the mobile app protects premium coaching APIs.
+// Illustrative middleware: store policy and verification freshness are app-specific.
+function requireFeature(feature: Feature) {
+  return async (req: any, res: any, next: any) => {
+    const grants = await entitlementService.forUser(req.user.id);
+    if (!grants.activeFeatures.includes(feature)) {
+      return res.status(403).json({ error: "subscription_required", feature });
+    }
+    next();
+  };
+}
+
+app.get("/v1/coaching/program", authenticateUser, requireFeature("coaching"), handler);
+Protect exported workout plans, AI-generated premium reports, and trainer workflows on the server. Cache verified entitlements with a clearly bounded lifetime and a strategy to invalidate them on revocation. Server-side authorization remains required even if the user interface is cached for offline display.
+9. Difficult lifecycle cases
+Situation	Correct approach
+User cancels auto-renewal	Keep access through the verified paid-through date unless otherwise revoked
+Renewal payment fails	Follow confirmed store status; grace and account hold differ by platform/configuration
+Refund or revocation	Reverify and revoke affected grants promptly
+Duplicate or out-of-order event	Deduplicate event, then reconcile latest current state
+App reinstall	Recover eligible store purchases and query user-linked entitlements
+Different app account claims purchase	Deny silent takeover; use audited support/recovery flow
+Google token changes on plan replacement	Preserve and resolve linked token / purchase lineage
+Store API unavailable	Retry verification and mark state stale; do not invent a new paid grant
+Client offline during purchase	Retry backend verification when connectivity returns
+Upgrade or downgrade	Apply verified store-specific effective timing; don't assume immediate tier switch
+
+
+For short-lived verifier outages, decide explicitly whether to continue existing, recently verified entitlements for a narrow tolerance interval. Record the security and revenue trade-off; never authorize a new paid subscription from an unverified client assertion.
+10. Security and privacy
+- Secrets: keep Apple API signing credentials, Google service credentials, and Pub/Sub configuration server-side; rotate and scope access.
+- Webhooks: verify Apple JWS and appropriate Google Pub/Sub transport identity before processing; defend against replay.
+- API security: authenticate clients, enforce ownership, rate-limit verification/restore operations, and validate payloads.
+- Logging: log correlation IDs, normalized states, retry counts, and errors—not raw purchase tokens, identity credentials, or fitness/health histories.
+- Queue reliability: use retries, dead-letter queues, processing metrics, and reconciliation jobs.
+- Data separation: store minimal subscription metadata away from workout, injury, nutrition, and health profiles wherever feasible.
+- Privacy: HIPAA and GDPR applicability depends on actual business relationships, territory, processing purposes, and legal roles; billing code alone establishes no legal compliance.
+Recommended related reading: fitness app HIPAA and GDPR considerations and fitness app data collection checklist.
+Environment configuration
+# Placeholders only. Store actual secrets in a secrets manager, not source control.
+APP_ENV=development
+APPLE_APP_BUNDLE_ID=com.example.fitness
+APPLE_APP_STORE_API_KEY_ID=<SECRET_REFERENCE>
+APPLE_APP_STORE_ISSUER_ID=<SECRET_REFERENCE>
+APPLE_PRIVATE_KEY_SECRET_PATH=<SECRET_MANAGER_PATH>
+GOOGLE_PLAY_PACKAGE_NAME=com.example.fitness
+GOOGLE_SERVICE_ACCOUNT_SECRET_PATH=<SECRET_MANAGER_PATH>
+DATABASE_URL=<SECRET_REFERENCE>
+11. Testing and troubleshooting
+Use Apple's StoreKit/sandbox testing and Google Play's licensing and test subscription facilities. Accelerated renewal behavior and simulated failure cases are not identical to real production timing. Test both client UI and backend state transitions.
+Symptom	Likely cause	Diagnostic action
+Paid user remains Free	Client callback succeeded; server verification missing/failed	Trace verification request, store response, DB commit, grant recomputation
+User loses access on cancellation	Cancellation treated as expiration	Check verified paid-through date and revocation state
+Duplicate premium grants	Notification handler not idempotent	Inspect event uniqueness and transactional update behavior
+Wrong user has Premium	Purchase ownership not enforced	Audit lineage-to-account bindings and restore flow
+Renewals never update	RTDN/V2 notifications misconfigured	Verify notification delivery/authentication and run reconciliation
+Google purchase refunded unexpectedly	Required acknowledgement not completed	Inspect purchase states and acknowledgement processing
+Webhook retry storm	Acknowledgement before durability or persistent 5xx	Inspect queue, delivery logs, backoff and dead-letter policy
+Upgrade loses access temporarily	Old/new identifiers treated as unrelated	Examine platform replacement and lineage tracking
+
+
+Automated test cases: purchase success; pending purchase; invalid signature; wrong bundle/package ID; duplicate transaction; cancellation; grace; hold; refund; expired entitlement; reinstall; account conflict; delayed event; queue outage; store API outage; cross-device synchronization; upgrades/downgrades.
+
+Example application-level test:
+// Pseudocode-style Jest test; fakeStore and service are project-owned fixtures.
+it("retains access after cancellation until verified expiration", async () => {
+  fakeStore.setVerifiedSubscription({
+    canceledAutoRenew: true,
+    paidThrough: new Date("2026-12-01T00:00:00Z"),
+    revoked: false
+  });
+  await service.reconcile("subscription_1");
+  expect(await service.canAccess("user_1", "training_plans", new Date("2026-11-01")))
+    .toBe(true);
+});
+12. Implementation checklist
+- [ ] Define plan-to-feature mapping independent of store identifiers.
+- [ ] Configure Apple products/groups and Google subscriptions/base plans/offers.
+- [ ] Model accounts, transactions, subscription lineage, notification inbox, and grants.
+- [ ] Verify app identity, product, signed data/token, lifecycle, and account ownership server-side.
+- [ ] Acknowledge eligible Google purchases according to official requirements.
+- [ ] Enforce every premium backend action through an entitlement service.
+- [ ] Verify notification authenticity; persist and deduplicate before acknowledgement.
+- [ ] Fetch current store state during notification processing.
+- [ ] Add scheduled reconciliation, retry/backoff, dead-letter queue, and alerts.
+- [ ] Support restore purchases and controlled account recovery.
+- [ ] Test failures, revocations, renewals, tier changes, and cross-device access.
+- [ ] Review privacy, secrets, logs, monitoring, and operational runbooks.
+13. Related implementation guides
+These resources are contextual reading, not dependencies of the subscription architecture:
+- Fitness app monetization and subscription model choices — business-level plan and trial decisions.
+- Testing fitness app integrations — QA for third-party systems.
+- Fitness app development and wearable integration — handling fitness data connections.
+- Fitness app development contracts: code and data ownership — repository, vendor, and handover considerations.
+- Fitness app HIPAA and GDPR — privacy and regulatory boundaries.
+Official reference documentation
+- Apple StoreKit
+- Apple App Store Server API
+- Apple App Store Server Notifications V2
+- Google Play Billing
+- Google Play subscription lifecycle and RTDN
+Engineering takeaway
+A dependable fitness subscription system does not ask “Did the client say payment succeeded?” It asks “What does the verified store state entitle this authenticated account to access right now?” Make that decision centrally, process notifications idempotently, recover through reconciliation, and keep user account ownership explicit.
